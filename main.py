@@ -1,20 +1,17 @@
-import json
+import yaml, json
 import os
 from logging.handlers import RotatingFileHandler
 from flask import Flask, request, jsonify, Response
 from jsonformatter import JsonFormatter
 import logging
-from openapi_schema_to_json_schema import to_json_schema
 from xsdata.formats.dataclass.context import XmlContext
 from xsdata.formats.dataclass.parsers import XmlParser
 from xsdata.formats.dataclass.parsers.config import ParserConfig
+import xml.etree.ElementTree as ET
 
 app = Flask(__name__)
-path = os.getenv("URL_PATH", "/api")
-method = os.getenv("METHOD", "POST")
 
 
-# Настройка логирования
 def setup_logging():
     log_handler = RotatingFileHandler(
         "/opt/synapse/logs/log.log", maxBytes=1000000, backupCount=3
@@ -42,7 +39,61 @@ def setup_logging():
     app.logger.setLevel(logging.INFO)
 
 
-# Загрузка данных из конфигмапы
+def log_error(e, status):
+    app.logger.error(
+        str(e),
+        extra={
+            "URL": request.path,
+            "method": request.method,
+            "remoteAddr": request.remote_addr,
+            "status": str(status),
+            "traceid": request.headers.get("x-b3-traceId", "none"),
+        },
+    )
+
+
+def log_info(message, status):
+    app.logger.info(
+        message,
+        extra={
+            "URL": request.path,
+            "method": request.method,
+            "remoteAddr": request.remote_addr,
+            "status": str(status),
+            "traceid": request.headers.get("x-b3-traceId", "none"),
+        },
+    )
+
+
+def detect_data_type(data):
+    try:
+        json.loads(data)
+        return "json"
+    except ValueError:
+        pass
+    try:
+        yaml.safe_load(data)
+        return "yaml"
+    except ValueError:
+        pass
+    try:
+        ET.fromstring(data)
+        return "xml"
+    except ET.ParseError:
+        raise ValueError("Data cannot be processed as JSON, YAML or XML")
+
+
+def get_spec(config):
+    spec = config["spec"]
+    data_type = config["type"]
+    if data_type == "yaml":
+        return yaml.safe_load(spec)
+    elif data_type == "json":
+        return json.loads(spec)
+    elif data_type == "xml":
+        return ET.fromstring(spec)
+
+
 def load_config():
     CONFIG_MESSAGE = os.getenv("CONFIG_MESSAGE")
     CONFIG_SPEC = os.getenv("CONFIG_SPEC")
@@ -51,61 +102,70 @@ def load_config():
         print("Loaded message from configmap")
         return {"message": CONFIG_MESSAGE}
     elif CONFIG_SPEC:
+        data_type = detect_data_type(CONFIG_SPEC)
         print("Loaded spec from configmap")
-        return {"spec": CONFIG_SPEC}
+
+        return {"type": data_type, "spec": CONFIG_SPEC}
     else:
         raise ValueError(
             "Neither CONFIG_MESSAGE nor CONFIG_SPEC environment variables are set"
         )
 
 
-# Загрузка скрипта из конфигмапы и его выполнение
 def exec_script(data, response):
     SCRIPT = os.getenv("SCRIPT")
     if SCRIPT:
-        try:
-            exec(SCRIPT)
-        except Exception as e:
-            app.logger.error(
-                str(e),
-                extra={
-                    "URL": request.path,
-                    "method": request.method,
-                    "remoteAddr": request.remote_addr,
-                    "status": "500",
-                    "traceid": request.headers.get("x-b3-traceId", "none"),
-                },
-            )
-            return jsonify({"error": str(e)}), 500
+        exec(SCRIPT)
 
 
-# Генерация ответа из Json Schema
-def generate_example_from_schema(schema):
+def resolve_ref(schema, ref):
+    parts = ref.split("/")
+    current = schema
+    for part in parts:
+        if part == "#":
+            continue
+        elif part in current:
+            current = current[part]
+        else:
+            raise KeyError(f"Invalid reference: {ref}")
+    return current
+
+
+def generate_example_from_schema(schema, refs={}):
     example = {}
     for prop, details in schema["properties"].items():
-        if "example" in details:
+        if "$ref" in details:
+            ref = details["$ref"]
+            if ref not in refs:
+                refs[ref] = resolve_ref(schema, ref)
+            example[prop] = generate_example_from_schema(refs[ref], refs)
+        elif "example" in details:
             example[prop] = details["example"]
         elif "default" in details:
             example[prop] = details["default"]
         elif details["type"] == "object":
-            example[prop] = generate_example_from_schema(details)
+            example[prop] = generate_example_from_schema(details, refs)
         elif details["type"] == "array":
-            example[prop] = [generate_example_from_schema(details["items"])]
+            example[prop] = [generate_example_from_schema(details["items"], refs)]
         else:
             example[prop] = f"Example {details['type']}"
     return example
 
 
-# Генерация ответа из OpenAPI
 def generate_response_from_openapi(spec, endpoint, method):
-    schema = spec["paths"][endpoint][method]["responses"]["200"]["content"][
-        "application/json"
-    ]["schema"]
-    json_schema = to_json_schema(schema)
-    return generate_example_from_schema(json_schema)
+    response = spec["paths"][endpoint][method]["responses"]["200"]
+    content_type = "application/json"
+    if "content" in response and content_type in response["content"]:
+        media_type = response["content"][content_type]
+        if "schema" in media_type:
+            schema = media_type["schema"]
+            if "$ref" in schema:
+                ref = schema["$ref"]
+                schema = resolve_ref(spec, ref)
+            return generate_example_from_schema(schema)
+    raise ValueError("Response schema not found")
 
 
-# Генерация ответа из XSD
 def generate_response_from_xsd(spec):
     config = ParserConfig(fail_on_unknown_properties=False)
     context = XmlContext()
@@ -114,73 +174,62 @@ def generate_response_from_xsd(spec):
     return schema
 
 
-# Генерация ответа из WSDL
 def generate_response_from_wsdl(client, service_name, operation_name):
     service = client.service[service_name]
     operation = service[operation_name]
     return operation._binding.input.body.parts[0].element(signature=True)
 
 
-# Функция для обработки запроса
-def handle_request(data, endpoint):
-    # Логирование входящего запроса
-    app.logger.info(
-        "Received request",
-        extra={
-            "URL": request.path,
-            "method": request.method,
-            "remoteAddr": request.remote_addr,
-            "status": "received",
-            "traceid": request.headers.get("x-b3-traceId", "none"),
-        },
-    )
-    # Загрузка конфигмапы
-    try:
-        config = load_config()
-    except ValueError as ve:
-        app.logger.error(
-            str(ve),
-            extra={
-                "URL": request.path,
-                "method": request.method,
-                "remoteAddr": request.remote_addr,
-                "status": "500",
-                "traceid": request.headers.get("x-b3-traceId", "none"),
-            },
-        )
-        return jsonify({"error": str(ve)}), 500
+def handle_request(data, endpoint, config):
+    log_info("Received request", "received")
 
-    # Генерация ответа из конфигмапы
     if "message" in config:
         response = json.loads(config["message"])
-        exec_script(data, response)
-        return jsonify(response), 200
-    elif "spec" in config:
-        spec = json.loads(config["spec"])
+        try:
+            exec_script(data, response)
+        except Exception as e:
+            log_error(e, 500)
+            return jsonify({"error": str(e)}), 500
 
-        # Генерация ответа из OpenAPI
+        log_info("Sending response", 200)
+        return jsonify(response), 200
+
+    elif "spec" in config:
+        spec = get_spec(config)
+
         if "openapi" in spec:
             response = generate_response_from_openapi(
-                spec["openapi"], endpoint, request.method.lower()
+                spec, endpoint, request.method.lower()
             )
-            exec_script(data, response)
+            try:
+                exec_script(data, response)
+            except Exception as e:
+                log_error(e, 500)
+                return jsonify({"error": str(e)}), 500
+            log_info("Sending response", 200)
             return jsonify(response), 200
 
-        # Генерация ответа из XSD
         elif "xsd" in spec:
-            response = generate_response_from_xsd(spec["xsd"], "ResponseElement")
-            exec_script(data, response)
+            response = generate_response_from_xsd(spec, "ResponseElement")
+            try:
+                exec_script(data, response)
+            except Exception as e:
+                log_error(e, 500)
+                return jsonify({"error": str(e)}), 500
+            log_info("Sending response", 200)
             return Response(response, mimetype="application/xml")
 
-        # Генерация ответа из WSDL
         elif "wsdl" in spec:
-            client = generate_response_from_wsdl(
-                spec["wsdl"], "ServiceName", "OperationName"
-            )
-            exec_script(data, response)
+            client = generate_response_from_wsdl(spec, "ServiceName", "OperationName")
+            try:
+                exec_script(data, response)
+            except Exception as e:
+                log_error(e, 500)
+                return jsonify({"error": str(e)}), 500
+            log_info("Sending response", 200)
             return jsonify(client), 200
 
-    # Если спецификация не указана, вернуть ошибку
+    log_error("No specification provided", 400)
     return jsonify({"error": "No specification provided"}), 400
 
 
@@ -190,23 +239,29 @@ def get_endpoints():
     try:
         config = load_config()
         if "spec" in config:
-            spec = json.loads(config["spec"])
+            spec = get_spec(config)
             endpoints = []
             if "openapi" in spec:
-                for path, methods in spec["openapi"]["paths"].items():
+                for path, methods in spec["paths"].items():
                     for method in methods.keys():
-                        endpoints.append((path, method))
+                        endpoints.append((path, method[0]))
+            log_info("Sending response", 200)
             return jsonify(endpoints), 200
         else:
+            log_error("No specification provided", 400)
             return jsonify({"error": "No specification provided"}), 400
     except Exception as e:
+        log_error(e, 500)
         return jsonify({"error": str(e)}), 500
 
 
 # Создание endpoint'а без спецификации
-def create_endpoint_for_message(app):
+def create_endpoint_for_message(app, config):
+    path = os.getenv("URL_PATH", "/api")
+    method = os.getenv("METHOD", "POST")
+
     def handler():
-        return handle_request(request.json, path)
+        return handle_request(request.json, path, config)
 
     app.add_url_rule(path, "default", handler, methods=[method.upper()])
     print(f"Created endpoint: {path} ({method.upper()})")
@@ -214,39 +269,34 @@ def create_endpoint_for_message(app):
 
 # Динамическое создание endpoint'ов на основе спецификации
 def create_endpoints_from_spec(app, config):
-    spec = json.loads(config["spec"])
+    spec = get_spec(config)
     if "openapi" in spec:
-        for path, methods in spec["openapi"]["paths"].items():
-            i = 0
-            for method, details in methods.items():
-                i += 1
-                endpoint_name = details["operationId"]
-                if not endpoint_name:
-                    endpoint_name = f"Endpoint#{i}"
+        for path, methods in spec["paths"].items():
+            for method in methods.items():
 
                 def handler():
-                    return handle_request(request.json, path)
+                    return handle_request(request.json, path, config)
 
-                app.add_url_rule(path, endpoint_name, handler, methods=[method.upper()])
-                print(f"Created endpoint: {path} ({method.upper()})")
+                app.add_url_rule(path, path, handler, methods=[method[0].upper()])
+                print(f"Created endpoint: {path} ({method[0].upper()})")
     else:
         create_endpoint_for_message(app, config)
 
 
-# Инициализация приложения
 def initialize_app():
     try:
         config = load_config()
         if "spec" in config:
             create_endpoints_from_spec(app, config)
         else:
-            create_endpoint_for_message(app)
+            create_endpoint_for_message(app, config)
     except Exception as e:
         app.logger.error(str(e))
         raise e
 
 
+setup_logging()
+initialize_app()
+
 if __name__ == "__main__":
-    setup_logging()
-    initialize_app()
     app.run(debug=True)

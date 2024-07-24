@@ -1,5 +1,5 @@
 Flask
+pyyaml
 jsonschema
 jsonformatter
-py-openapi-schema-to-json-schema
 xsdata
